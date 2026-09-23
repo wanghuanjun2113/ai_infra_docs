@@ -6,7 +6,7 @@
 
 ## 1. 范围与版本
 
-核对日期：2026-09-22。
+核对日期：2026-09-22；2026-09-23 补充 Tool Result 上下文顺序说明，源码版本不变。
 
 | 对象 | 核对版本 |
 |---|---|
@@ -427,6 +427,79 @@ Responses 也可引用已保存的响应，在新请求中仅提供新增输入�
 
 `previous_response_id` 用于在服务层找回历史消息和输出，再构造输入；上述源码没有把这个 ID 当作设备 KV block 标识。响应历史存储和推理引擎的 KV cache 是不同机制，不能因为使用响应链就推断“跳过 prefill”或“必然命中 prefix cache”。
 
+### 7.4 Agent 执行过程中，Tool Result 放在哪里？
+
+**通常按交互顺序追加：用户问题 → assistant 工具调用 → Tool Result → assistant 继续生成。当前讨论的路径不会自动把工具结果搬到整个上下文最前面。**
+
+需要区分两个层次：Agent 决定向服务端提交什么历史、按什么顺序提交；vLLM 解析协议并执行模型模板，模板决定角色标记和具体文本包装。
+
+#### 上下文怎样随着工具调用增长
+
+假设用户要求比较两个城市，Agent 顺序执行两次工具调用。第二次工具返回后，下一次模型请求的逻辑上下文为：
+
+```text
+system：系统指令
+user：比较杭州和上海的天气，推荐一个散步地点
+assistant：调用 get_weather("杭州")
+tool：杭州晴，25℃
+assistant：调用 get_weather("上海")
+tool：上海小雨，22℃
+assistant：根据两个结果给出建议 ← 本轮待生成
+```
+
+天气值为示例数据。每次工具结果处于对应调用之后，原始问题仍在历史中，不需要在每次工具返回后再重复追加一遍。这里的“追加”描述逻辑上下文增长；采用无状态请求时，应用一般重新发送包含历史的请求，并不意味着服务端自动维护了会话。
+
+OpenAI 官方函数调用示例将模型调用记录及 `function_call_output` 追加到输入历史；Anthropic 要求在对应 assistant 工具调用消息之后，紧接着提供含 `tool_result` 的 user 消息。[OpenAI 函数调用文档][openai-function-calling]、[Anthropic 工具结果规则][anthropic-tool-results]。
+
+#### 三种接口的顺序由哪些代码保证
+
+| 接口 | 当前实现的处理顺序 | 源码 |
+|---|---|---|
+| Chat Completions | 遍历传入 `messages`，依次向 `conversation` 追加解析结果 | [`parse_chat_messages_async()`][chat-message-order] |
+| Anthropic Messages | 按消息列表遍历；将 user 的 `tool_result` 转成内部 tool 消息，在处理该轮时追加 | [`_convert_messages()`][anthropic-message-order]、[`_convert_user_tool_result()`][anthropic-tool-convert] |
+| Responses | 先放当前 instructions、恢复历史，再追加新的 input；`function_call_output` 转成内部 tool 消息 | [`construct_input_messages()`][responses-utils]、[结果转换分支][responses-tool-convert] |
+
+Chat 路径的核心操作如下，省略了与顺序无关的参数：
+
+```python
+for msg in messages:
+    sub_messages = _parse_chat_message_content(...)
+    conversation.extend(sub_messages)
+```
+
+它按输入列表顺序处理，没有在这里按角色把所有工具结果集中到最前面，也没有按工具实际完成时间重新排序。Responses 的条目转换会组合某些相邻 assistant 条目，但工具结果仍在相应输入位置转成 tool 消息。
+
+#### Qwen3.6：包装成 user 段，不改变所在轮次
+
+第 5.2 节已经展示完整消息结构。其工具结果片段是：
+
+```text
+<|im_start|>user
+<tool_response>
+杭州晴，25℃
+</tool_response><|im_end|>
+```
+
+这个片段位于 assistant 的 `<tool_call>` 段之后，下一次 assistant 生成前缀之前。它与用户问题一样占据 token 序列中的位置，但有 `<tool_response>` 包装，用于表达工具返回。连续多个 tool 消息可被合并进同一个 user 段，内部依次放多个 `<tool_response>`；这是该版本模板的行为。[Qwen3.6 工具结果模板分支][qwen-tool-result]。
+
+**工具定义与工具结果的位置不同：**
+
+| 内容 | 本例 Qwen3.6 模板的位置 |
+|---|---|
+| 工具定义：名称、描述、参数 schema | 前面的 system 段 |
+| 工具调用：模型要求执行哪个函数 | 对应轮次的 assistant 段 |
+| 工具结果：某次调用返回的数据 | 对应调用之后，以 user 段中的 `<tool_response>` 包装 |
+
+因此，看到工具 schema 在 prompt 前面，不能推断 Tool Result 也被前置。
+
+#### Anthropic 的局部排序与其他边界
+
+Anthropic 官方要求：如果同一条 user 消息既包含工具结果，又包含普通文本，`tool_result` 块应在普通文本块之前。当前 vLLM 转换也会在处理内容块时先追加 tool 消息，再追加收集出的普通 user 文本。这是**同一轮内的局部排列**，不是把工具结果移动到整段历史开头；对不符合官方块顺序的输入，也不能声称转换会逐块原样保序。[官方规则][anthropic-tool-results]、[`_convert_message_content()`][anthropic-content-order]。
+
+vllm-ascend 的模型执行阶段收到的是组织好的 `input_ids` 等张量，不在此处重新识别 HTTP Tool Result 并调换其位置。[模型调用][ascend-runner]。
+
+如果某个 Agent 把检索结果放在问题前面，或把旧工具结果压缩进摘要，应继续追踪该 Agent 的上下文构造逻辑或自定义模板。本文核对的 vLLM 路径没有统一执行这种前置操作，也不能据此推断所有 Agent 框架的上下文策略。
+
 ## 8. 当前兼容范围与接入检查
 
 当前源码已经注册三个生成接口。Anthropic 还提供 `/v1/messages/count_tokens`；Responses 提供获取和取消响应的路由。[生成服务注册][registration]、[Anthropic 路由][anthropic-route]、[Responses 路由][responses-route]。
@@ -471,7 +544,7 @@ curl http://localhost:8000/v1/chat/completions   -H 'Content-Type: application/j
 - [Responses API 路由][responses-route]、[协议模型][responses-protocol]、[条目转换][responses-utils]、[生成与存储][responses-serving]。
 - [服务注册][registration]、[OnlineRenderer][renderer]、[HF 模板渲染][hf]、[模板后编码][base-renderer]、[工具参数规范化][chat-utils]。
 - [vLLM-Ascend 模型执行][ascend-runner]、[Qwen3.6-27B 官方模板][qwen-template]。
-- [OpenAI Responses 迁移指南][openai-migration]、[Anthropic Messages API 文档][anthropic-doc]。
+- [OpenAI Responses 迁移指南][openai-migration]、[OpenAI 函数调用文档][openai-function-calling]、[Anthropic Messages API 文档][anthropic-doc]、[Anthropic 工具结果规则][anthropic-tool-results]。
 
 [chat-route]: https://github.com/wanghuanjun2113/vllm/blob/eb42686a30cddf325ffeff7b3bd5e3a7298c2c00/vllm/entrypoints/openai/chat_completion/api_router.py#L42
 [chat-protocol]: https://github.com/wanghuanjun2113/vllm/blob/eb42686a30cddf325ffeff7b3bd5e3a7298c2c00/vllm/entrypoints/openai/chat_completion/protocol.py
@@ -493,3 +566,11 @@ curl http://localhost:8000/v1/chat/completions   -H 'Content-Type: application/j
 [qwen-template]: https://huggingface.co/Qwen/Qwen3.6-27B/blob/6a9e13bd6fc8f0983b9b99948120bc37f49c13e9/chat_template.jinja
 [openai-migration]: https://developers.openai.com/api/docs/guides/migrate-to-responses
 [anthropic-doc]: https://platform.claude.com/docs/en/api/messages/create
+[chat-message-order]: https://github.com/wanghuanjun2113/vllm/blob/eb42686a30cddf325ffeff7b3bd5e3a7298c2c00/vllm/entrypoints/chat_utils.py#L2197
+[anthropic-message-order]: https://github.com/wanghuanjun2113/vllm/blob/eb42686a30cddf325ffeff7b3bd5e3a7298c2c00/vllm/entrypoints/anthropic/serving.py#L274
+[anthropic-content-order]: https://github.com/wanghuanjun2113/vllm/blob/eb42686a30cddf325ffeff7b3bd5e3a7298c2c00/vllm/entrypoints/anthropic/serving.py#L307
+[anthropic-tool-convert]: https://github.com/wanghuanjun2113/vllm/blob/eb42686a30cddf325ffeff7b3bd5e3a7298c2c00/vllm/entrypoints/anthropic/serving.py#L406
+[responses-tool-convert]: https://github.com/wanghuanjun2113/vllm/blob/eb42686a30cddf325ffeff7b3bd5e3a7298c2c00/vllm/entrypoints/openai/responses/utils.py#L312
+[qwen-tool-result]: https://huggingface.co/Qwen/Qwen3.6-27B/blob/6a9e13bd6fc8f0983b9b99948120bc37f49c13e9/chat_template.jinja#L131
+[openai-function-calling]: https://developers.openai.com/api/docs/guides/function-calling
+[anthropic-tool-results]: https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls
